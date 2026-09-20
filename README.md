@@ -1,0 +1,30 @@
+# Pac-Man × TypeSafe Jev 1.13
+
+2D canvas Pac-Man (no frameworks, zero dependencies, no CDNs) that plays itself. Every junction decision is made by **TypeSafe Jev 1.13**, a System One structured decision model, through the OpenRouter Decisions API. A sidepane shows live Jev statistics: latency, calibrated probabilities per direction, danger estimates, confidence, token usage, and cost.
+
+## Run
+
+Requires Node 18+ (no npm install needed, zero dependencies).
+
+```bash
+cp .env.template .env        # put your OpenRouter key in .env
+node server.mjs              # serves http://localhost:4317
+```
+
+The API key stays on the server; the browser only talks to the local proxy at `/api/decide`.
+
+## How the AI plays
+
+- Pac-Man moves cell to cell on a 19×21 grid.
+- At every junction (2+ legal directions) the current state is sent to `POST https://openrouter.ai/api/alpha/decisions` with two questions: a `choice` (which direction next) and a `noul` (is a ghost dangerously close).
+- The state is a local 9×9 map centered on Pac-Man (with the ghost house marked impassable), ghost distances, and a per-direction corridor analysis (dots, pellets, ghost danger) embedded in the choice criteria.
+- Jev returns calibrated probabilities per legal direction; the game plays a temperature-0.5 sample of those probabilities (best move usually, occasional exploration to avoid path loops).
+- A deterministic rule layer re-checks Jev's pick against fresh positions when the response arrives (ghosts moved during the API round trip): a safety override replaces suicide moves with the clearly safer legal move, and a food override replaces empty paths with equally safe, clearly richer ones (points per cell distance: frightened ghost 200 > pellet 50 > dot 10). Overrides are shown in the sidepane and log.
+- Corridors (only one legal move) skip the API; on API errors the game falls back to a random legal move.
+
+## Files
+
+- `server.mjs` - static server + Decisions API proxy
+- `public/game.js` - 2D canvas renderer, game logic, AI controller, stats
+- `public/maze.mjs` - the maze layout (shared with `validate.mjs`)
+- `validate.mjs` - maze sanity checks (shape, reachability, connectivity)

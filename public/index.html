@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pac-Man · driven by TypeSafe Jev 1.13</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="app">
+  <section class="game-col">
+    <div class="hud">
+      <div class="hud-item">SCORE <span class="val" id="hud-score">0</span></div>
+      <div class="hud-item">LEVEL <span class="val" id="hud-level">1</span></div>
+      <div class="hud-item">DOTS <span class="val" id="hud-dots">0</span></div>
+      <div class="hud-item">LIVES <span class="val" id="hud-lives">●●●</span></div>
+      <div class="hud-item">FRIGHT <span class="val" id="hud-fright">—</span></div>
+      <div id="hud-status">starting…</div>
+    </div>
+    <div id="canvas-wrap">
+      <canvas id="game"></canvas>
+      <div id="overlay" class="hidden">
+        <h2 id="ov-title">GAME OVER</h2>
+        <pre id="ov-stats"></pre>
+        <button id="ov-btn">Start New Game</button>
+      </div>
+    </div>
+  </section>
+
+  <aside class="sidepane">
+    <div class="card head">
+      <div class="row"><span class="brand">TypeSafe <b>Jev 1.13</b></span><span class="badge">SYSTEM ONE</span></div>
+      <div class="row muted">structured decision model · OpenRouter</div>
+      <div class="facts">
+        <div><span>Price</span><b>$0.042 / 1M in · $0 out</b></div>
+        <div><span>Context</span><b>32K</b></div>
+        <div><span>Released</span><b>Sep 18 2026</b></div>
+        <div><span>Uptime (3d)</span><b>99.99%</b></div>
+        <div><span>Availability</span><b>99.98%</b></div>
+        <div><span>Platform volume</span><b>5.76B in · 579M out</b></div>
+      </div>
+      <div id="s-key-warn" class="warn hidden">API key missing on server. Set OPENROUTER_API_KEY in .env, restart server. Falling back to random moves.</div>
+    </div>
+
+    <div class="card">
+      <h3>Session</h3>
+      <div class="stat-grid">
+        <div class="stat"><div class="k">Decisions</div><div class="v" id="s-calls">0</div></div>
+        <div class="stat"><div class="k">Forced moves</div><div class="v" id="s-forced">0</div></div>
+        <div class="stat"><div class="k">Avg latency</div><div class="v" id="s-lat-avg">—</div></div>
+        <div class="stat"><div class="k">Last latency</div><div class="v" id="s-lat-last">—</div></div>
+        <div class="stat"><div class="k">Avg confidence</div><div class="v" id="s-conf">—</div></div>
+        <div class="stat"><div class="k">Errors</div><div class="v" id="s-err">0</div></div>
+        <div class="stat"><div class="k">Tokens in</div><div class="v" id="s-tok">0</div></div>
+        <div class="stat"><div class="k">Est. cost</div><div class="v" id="s-cost">$0.00000</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Latest decision</h3>
+      <div id="s-latest" class="latest"><div class="muted">waiting for first call…</div></div>
+    </div>
+
+    <div class="card">
+      <h3>Direction picks</h3>
+      <div id="s-dist"></div>
+    </div>
+
+    <div class="card">
+      <h3>Latency (ms)</h3>
+      <canvas id="s-spark" width="368" height="64"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>Log</h3>
+      <ul id="s-log" class="log"></ul>
+    </div>
+
+    <div class="card controls">
+      <button id="btn-pause">Pause</button>
+      <button id="btn-restart">New game</button>
+      <label class="speed">Speed
+        <input type="range" id="speed" min="150" max="600" value="240" step="10">
+        <span id="speed-val">240ms</span>
+      </label>
+    </div>
+  </aside>
+</main>
+<script type="module" src="game.js"></script>
+</body>
+</html>
