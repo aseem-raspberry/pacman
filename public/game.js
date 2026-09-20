@@ -7,12 +7,12 @@ import { MAZE } from './maze.mjs';
 const DIRS = { up: { dx: 0, dy: -1 }, down: { dx: 0, dy: 1 }, left: { dx: -1, dy: 0 }, right: { dx: 1, dy: 0 } };
 const OPP = { up: 'down', down: 'up', left: 'right', right: 'left' };
 const GHOST_COLORS = ['#ff2121', '#ffb8ff', '#00ffff', '#ffb852'];
-const GHOST_SPEED_FACTOR = 2.0;
+const GHOST_SPEED_FACTOR = 2.2;
 const FRIGHT_MS = 7000;
 const DECIDE_TIMEOUT = 12000;
 const WIN_R = 3;          // local map radius -> 7x7 window
 const PRE_DIST = 4;       // pre-fetch junctions up to this many cells ahead
-const THREAT_CELLS = 3;   // look-ahead cells for the pursuit check
+const THREAT_CELLS = 4;   // look-ahead cells for the pursuit check
 const TAU = Math.PI * 2;
 
 const H = MAZE.length, W = MAZE[0].length;
