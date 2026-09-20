@@ -1,4 +1,6 @@
 // Pac-Man (2D canvas) played by TypeSafe Jev 1.13 via the OpenRouter Decisions API.
+// Decisions are pre-fetched one junction ahead, so the API latency is hidden
+// behind pacman's travel time instead of pausing the game.
 import { MAZE } from './maze.mjs';
 
 /* ---------------- constants ---------------- */
@@ -8,7 +10,8 @@ const GHOST_COLORS = ['#ff2121', '#ffb8ff', '#00ffff', '#ffb852'];
 const GHOST_SPEED_FACTOR = 2.0;
 const FRIGHT_MS = 7000;
 const DECIDE_TIMEOUT = 12000;
-const WIN_R = 4;          // local map radius -> 9x9 window
+const WIN_R = 3;          // local map radius -> 7x7 window
+const PRE_DIST = 4;       // pre-fetch junctions up to this many cells ahead
 const TAU = Math.PI * 2;
 
 const H = MAZE.length, W = MAZE[0].length;
@@ -64,6 +67,8 @@ let freezeMs = 0, pendingReset = null;
 let paused = false, gameOverFlag = false;
 let ghostsFrozen = false;   // test hook: stops ghost movement
 let decisionToken = 0;
+let preDecision = null;     // arrived pre-fetch result, not yet applied
+let preInFlight = null;     // pre-fetch request still in flight
 const sessionId = 'pacman-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now();
 const startTime = performance.now();
 
@@ -71,6 +76,7 @@ const pac = {
   col: pacStart.col, row: pacStart.row, dir: 'left',
   fx: pacStart.col, fz: pacStart.row, fromx: pacStart.col, fromz: pacStart.row,
   tx: pacStart.col, tz: pacStart.row, prog: 1, moving: false, waiting: false,
+  waitStart: 0,
 };
 
 const ghosts = ghostStarts.map(s => ({
@@ -80,8 +86,8 @@ const ghosts = ghostStarts.map(s => ({
 }));
 
 const stats = {
-  calls: 0, forced: 0, errors: 0, overrides: 0, inTok: 0, outTok: 0, cost: 0,
-  lat: [], conf: [], danger: [], chosen: { up: 0, down: 0, left: 0, right: 0 },
+  calls: 0, forced: 0, errors: 0, overrides: 0, preHits: 0, inTok: 0, outTok: 0, cost: 0,
+  lat: [], conf: [], danger: [], waits: [], chosen: { up: 0, down: 0, left: 0, right: 0 },
   offered: { up: 0, down: 0, left: 0, right: 0 }, probSum: { up: 0, down: 0, left: 0, right: 0 },
   log: [], last: null,
 };
@@ -123,6 +129,7 @@ function eatCell(c, r) {
     updateHud();
   } else if (ch === 'o') {
     score += 50;
+    decisionToken++;          // strategy flipped: invalidate in-flight pre-fetches
     frightMs = FRIGHT_MS; frightCombo = 0;
     grid[r][c] = ' ';
     ghosts.forEach(g => { if (g.state === 'chase') g.fright = true; });
@@ -153,10 +160,24 @@ function updatePac(dt) {
       pac.dir = legal[0];
       stats.forced++;
       startPacMove();
+      maybePreRequest();
     } else if (legal.length > 1) {
-      pac.waiting = true;
-      setStatus('Jev deciding…', 'wait');
-      jevDecide();
+      if (preDecision && preDecision.col === pac.col && preDecision.row === pac.row && preDecision.dir === pac.dir) {
+        const pd = preDecision;
+        preDecision = null;
+        pd.pre = true;
+        finalizeDecision(pd);
+      } else if (preInFlight && preInFlight.col === pac.col && preInFlight.row === pac.row && preInFlight.dir === pac.dir) {
+        pac.waiting = true;
+        pac.waitStart = performance.now();
+        setStatus('Jev deciding…', 'wait');
+      } else {
+        if (preDecision) preDecision = null;   // stale, discard
+        pac.waiting = true;
+        pac.waitStart = performance.now();
+        setStatus('Jev deciding…', 'wait');
+        jevDecide();
+      }
     }
   }
 }
@@ -256,6 +277,7 @@ function pacDies() {
   if (gameOverFlag || freezeMs > 0) return;
   lives--;
   decisionToken++;
+  preDecision = null; preInFlight = null;
   pac.waiting = false; pac.moving = false;
   updateHud();
   if (lives <= 0) { gameOver(); return; }
@@ -268,6 +290,7 @@ function pacDies() {
 function gameOver() {
   gameOverFlag = true;
   paused = true;
+  preDecision = null; preInFlight = null;
   $('ov-title').textContent = 'GAME OVER';
   $('ov-stats').textContent =
     `score            ${score}\n` +
@@ -279,6 +302,7 @@ function gameOver() {
 }
 
 function resetPositions() {
+  preDecision = null; preInFlight = null;
   pac.col = pacStart.col; pac.row = pacStart.row; pac.dir = 'left';
   pac.fx = pac.col; pac.fz = pac.row;
   pac.prog = 1; pac.moving = false; pac.waiting = false;
@@ -300,21 +324,21 @@ function applyLevelReset() {
   updateHud();
 }
 
-/* ---------------- Jev context builder ---------------- */
-function localWindow() {
+/* ---------------- Jev context builders (parametrized by position) ---------------- */
+function makeWindow(cx, cy, board) {
   const rows = [];
-  for (let r = pac.row - WIN_R; r <= pac.row + WIN_R; r++) {
+  for (let r = cy - WIN_R; r <= cy + WIN_R; r++) {
     let line = '';
-    for (let c = pac.col - WIN_R; c <= pac.col + WIN_R; c++) {
+    for (let c = cx - WIN_R; c <= cx + WIN_R; c++) {
       if (r < 0 || r >= H || c < 0 || c >= W) { line += '#'; continue; }
-      const ch = grid[r][c];
+      const ch = board[r][c];
       line += (ch === 'G' || ch === 'D') ? 'H' : ch;   // house cells: impassable, never "ghost"
     }
     rows.push(line);
   }
   for (const g of ghosts) {                             // real ghosts only
     if (g.state === 'eaten') continue;
-    const dc = g.col - (pac.col - WIN_R), dr = g.row - (pac.row - WIN_R);
+    const dc = g.col - (cx - WIN_R), dr = g.row - (cy - WIN_R);
     if (dc >= 0 && dc < 2 * WIN_R + 1 && dr >= 0 && dr < 2 * WIN_R + 1) {
       const s = rows[dr];
       rows[dr] = s.slice(0, dc) + (g.fright ? 'g' : 'G') + s.slice(dc + 1);
@@ -325,14 +349,18 @@ function localWindow() {
   return rows;
 }
 
-function dirInfo(d) {
+function makeDirInfo(d, cx, cy, board) {
   const dd = DIRS[d];
-  const danger = ghostDangerAt(pac.col + dd.dx, pac.row + dd.dy);
+  const danger = ghostDangerAt(cx + dd.dx, cy + dd.dy);
+  const open = (cc, rr) => {
+    const ch = board[rr]?.[cc];
+    return !!ch && ch !== '#' && ch !== 'G' && ch !== 'D';
+  };
   let len = 0, dot = null, pellet = null, gNear = null, gFright = null, dotCount = 0;
-  let c = pac.col + dd.dx, r = pac.row + dd.dy;
-  while (passable(c, r, false) && len < 8) {
+  let c = cx + dd.dx, r = cy + dd.dy;
+  while (open(c, r) && len < 8) {
     len++;
-    const ch = grid[r][c];
+    const ch = board[r][c];
     if (ch === '.') { dotCount++; if (dot === null) dot = len; }
     if (ch === 'o' && pellet === null) pellet = len;
     for (const g of ghosts) {
@@ -342,7 +370,7 @@ function dirInfo(d) {
     }
     c += dd.dx; r += dd.dy;
   }
-  while (passable(c, r, false)) { len++; c += dd.dx; r += dd.dy; }
+  while (open(c, r)) { len++; c += dd.dx; r += dd.dy; }
   return { len, dot, pellet, gNear, gFright, danger, dotCount };
 }
 
@@ -360,8 +388,8 @@ function ghostDangerAt(c, r) {
 // Greedy food value of a direction: points per cell distance to the best
 // nearby edible (frightened ghost 200 > pellet 50 > dot 10). Frightened ghosts
 // only count when the fright timer is long enough to reach them before it ends.
-function foodUtility(d) {
-  const info = dirInfo(d);
+function foodUtilityAt(d, cx, cy, board) {
+  const info = makeDirInfo(d, cx, cy, board);
   let u = 0;
   if (info.pellet !== null) u = Math.max(u, 50 / info.pellet);
   if (info.gFright !== null && frightMs > info.gFright * stepMs + 500) u = Math.max(u, 200 / info.gFright);
@@ -382,51 +410,48 @@ function dirDesc(d, info) {
   return parts.join(', ');
 }
 
-function ghostSummary() {
+function makeGhostSummary(cx, cy) {
   const parts = [];
   for (const g of ghosts) {
     if (g.state === 'eaten') continue;
-    const dist = Math.abs(g.col - pac.col) + Math.abs(g.row - pac.row);
+    const dist = Math.abs(g.col - cx) + Math.abs(g.row - cy);
     const dd = DIRS[g.dir];
-    const next = Math.abs(g.col + dd.dx - pac.col) + Math.abs(g.row + dd.dy - pac.row);
-    const outside = Math.abs(g.col - pac.col) > WIN_R || Math.abs(g.row - pac.row) > WIN_R;
+    const next = Math.abs(g.col + dd.dx - cx) + Math.abs(g.row + dd.dy - cy);
+    const outside = Math.abs(g.col - cx) > WIN_R || Math.abs(g.row - cy) > WIN_R;
     parts.push(`(${g.col},${g.row}) d=${dist} heading ${g.dir}${next < dist ? ' (toward you)' : ''}${outside ? ' (outside map)' : ''}${g.fright ? ' frightened' : ''}`);
   }
   return parts.length ? parts.join('; ') : 'none';
 }
 
-/* ---------------- Jev decision call ---------------- */
-function strategyLine(legal) {
-  if (frightMs > 0) {
-    return `FRIGHT ACTIVE (${(frightMs / 1000).toFixed(1)}s left): chase and eat the nearest frightened ghost; do not avoid frightened ghosts, but stop chasing when time is nearly out.`;
+function strategyLine(legal, cx, cy, board, fMs) {
+  if (fMs > 0) {
+    return `FRIGHT ACTIVE (${(fMs / 1000).toFixed(1)}s left): chase and eat the nearest frightened ghost; do not avoid frightened ghosts, but stop chasing when time is nearly out.`;
   }
-  const pelletNear = legal.some(d => { const i = dirInfo(d); return i.pellet !== null && i.pellet <= 6; });
+  const pelletNear = legal.some(d => { const i = makeDirInfo(d, cx, cy, board); return i.pellet !== null && i.pellet <= 6; });
   if (pelletNear) {
     return 'A power pellet is in reach: take it if any non-frightened ghost is nearby, it frightens all ghosts for 7s.';
   }
   return 'Eat dots: prefer directions with dots; avoid empty corridors when an equally safe dotted path exists.';
 }
 
-async function jevDecide() {
-  const token = ++decisionToken;
-  const legal = legalForPac();
-  const win = localWindow();
+function buildContext(cx, cy, dir, legal, board, fMs) {
+  const win = makeWindow(cx, cy, board);
   const state = [
     `Pac-Man game. Grid: ${W} cols x ${H} rows, origin (0,0) top-left, rows go down, cols go right.`,
-    `Local ${2 * WIN_R + 1}x${2 * WIN_R + 1} map centered on Pac-Man (P) at (${pac.col},${pac.row}), currently facing ${pac.dir}:`,
+    `Local ${2 * WIN_R + 1}x${2 * WIN_R + 1} map centered on Pac-Man (P) at (${cx},${cy}), currently facing ${dir}:`,
     ...win,
     `Legend: # wall, . dot (10 pts), o power pellet (50 pts, frightens ghosts 7s), H ghost house (impassable), G ghost, g frightened ghost (edible, 200+ pts), P Pac-Man.`,
-    `Ghosts (col,row, manhattan distance): ${ghostSummary()}`,
-    `Fright timer ${Math.round(frightMs)}ms${frightMs > 0 ? ' FRIGHT ACTIVE: ghosts are edible (200/400/800/1600 pts), chase them' : ''}. Score ${score}. Lives ${lives}. Dots left ${dotsLeft}.`,
+    `Ghosts (col,row, manhattan distance): ${makeGhostSummary(cx, cy)}`,
+    `Fright timer ${Math.round(fMs)}ms${fMs > 0 ? ' FRIGHT ACTIVE: ghosts are edible (200/400/800/1600 pts), chase them' : ''}. Score ${score}. Lives ${lives}. Dots left ${dotsLeft}.`,
   ].join('\n');
   const questions = {
     move: {
       type: 'choice',
       instructions: `Pac-Man (P) must move ONE cell now. Pick the best of: ${legal.join(', ')}. ` +
         'Scoring: dot +10, power pellet +50 (frightens all ghosts 7s), frightened ghost +200/400/800/1600. Non-frightened ghosts kill you. ' +
-        `${strategyLine(legal)} ` +
+        `${strategyLine(legal, cx, cy, board, fMs)} ` +
         'If a non-frightened ghost is within 3 cells and no pellet is in reach, pick the direction whose target cell is farthest from the nearest ghost. Never reverse.',
-      criteria: Object.fromEntries(legal.map(d => [d, dirDesc(d, dirInfo(d))])),
+      criteria: Object.fromEntries(legal.map(d => [d, dirDesc(d, makeDirInfo(d, cx, cy, board))])),
     },
     danger: {
       type: 'noul',
@@ -434,6 +459,19 @@ async function jevDecide() {
       criteria: { true: 'A non-frightened ghost is 4 cells or closer', false: 'No non-frightened ghost within 4 cells' },
     },
   };
+  return { state, questions };
+}
+
+/* ---------------- Jev decision pipeline ---------------- */
+// ctx: { col, row, dir, legal, segmentClear, isPre, token }
+async function requestDecision(ctx) {
+  const token = ctx.token;
+  const board = grid.map(r => r.join(''));
+  for (const [c, r] of ctx.segmentClear) {
+    if (board[r][c] === '.' || board[r][c] === 'o') board[r] = board[r].slice(0, c) + ' ' + board[r].slice(c + 1);
+  }
+  const fMs = Math.max(0, frightMs - ctx.segmentClear.length * stepMs);
+  const { state, questions } = buildContext(ctx.col, ctx.row, ctx.dir, ctx.legal, board, fMs);
   const t0 = performance.now();
   window.__pac.lastRequest = { state, questions };
   try {
@@ -442,7 +480,7 @@ async function jevDecide() {
     const res = await fetch('/api/decide', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId, state, questions }),
+      body: JSON.stringify({ session_id: sessionId, state, questions, provider: { sort: 'latency' } }),
       signal: ctrl.signal,
     });
     clearTimeout(to);
@@ -451,100 +489,158 @@ async function jevDecide() {
     if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
     const ans = data.answers?.move;
     if (!ans || ans.type !== 'choice') throw new Error(`malformed answer: ${JSON.stringify(ans)}`);
-    if (token !== decisionToken) return;
+    if (token !== decisionToken) { preInFlight = null; return; }
     const probs = ans.probabilities || {};
     const conf = typeof ans.confidence === 'number' ? ans.confidence : 0;
     const dAns = data.answers?.danger;
     const dangerP = dAns && dAns.type === 'noul' ? dAns.noul : null;
-    // argmax (for display) and temperature-0.5 sample (for play, breaks loops)
-    let top = legal[0], tp = -1;
-    const weights = legal.map(d => {
-      const p = typeof probs[d] === 'number' ? probs[d] : 0;
-      if (p > tp) { tp = p; top = d; }
-      return Math.max(0, p) ** 2;
-    });
-    const total = weights.reduce((a, b) => a + b, 0);
-    let chosen = legal[legal.length - 1];
-    if (total > 0) {
-      let rnd = Math.random() * total;
-      for (let i = 0; i < legal.length; i++) {
-        rnd -= weights[i];
-        if (rnd <= 0) { chosen = legal[i]; break; }
+    const decision = { col: ctx.col, row: ctx.row, dir: ctx.dir, legal: ctx.legal, probs, conf, dangerP, lat, data };
+    if (ctx.isPre) {
+      preInFlight = null;
+      if (pac.col === ctx.col && pac.row === ctx.row && pac.dir === ctx.dir && !pac.moving) {
+        finalizeDecision(decision);   // arrived already: apply now
+      } else {
+        preDecision = decision;       // still traveling: park it
       }
     } else {
-      chosen = legal[Math.floor(Math.random() * legal.length)];
+      finalizeDecision(decision);
     }
-    // Safety override: never commit into a cell with a non-frightened ghost in
-    // or adjacent to it when a safer legal move exists. Uses FRESH positions:
-    // ghosts kept moving during the API round trip, so the snapshot Jev saw
-    // is already stale.
-    let override = null;
-    const chosenDanger = ghostDangerAt(pac.col + DIRS[chosen].dx, pac.row + DIRS[chosen].dy);
-    if (Number.isFinite(chosenDanger) && chosenDanger <= 2) {
-      let safest = null, sd = -1;
-      for (const d of legal) {
-        const dg = ghostDangerAt(pac.col + DIRS[d].dx, pac.row + DIRS[d].dy);
-        if (dg > sd) { sd = dg; safest = d; }
-      }
-      // Override when ANY legal alternative is safer, even by one cell:
-      // an empty safe path always beats a chance of getting killed.
-      if (safest && sd > chosenDanger) {
-        override = { from: chosen, to: safest, reason: `ghost ${chosenDanger} from ${chosen} target vs ${sd} from ${safest}` };
-        chosen = safest;
-      }
-    }
-    // Food preference: if the chosen direction has little food value and an
-    // equally safe legal alternative is clearly richer, take the richer one.
-    if (!override) {
-      const cU = foodUtility(chosen);
-      let best = null, bestU = cU;
-      for (const d of legal) {
-        if (d === chosen) continue;
-        const dg = ghostDangerAt(pac.col + DIRS[d].dx, pac.row + DIRS[d].dy);
-        if (dg < chosenDanger) continue;          // not less safe
-        const u = foodUtility(d);
-        if (u > bestU) { bestU = u; best = d; }
-      }
-      if (best && bestU - cU >= 5) {
-        override = { from: chosen, to: best, reason: `food value ${bestU.toFixed(0)} on ${best} vs ${cU.toFixed(0)} on ${chosen}` };
-        chosen = best;
-      }
-    }
-    recordDecision({ legal, probs, chosen, top, conf, lat, data, dangerP, override });
-    if (token !== decisionToken) return;
-    pac.dir = chosen;
-    pac.waiting = false;
-    setStatus('moving');
-    if (!paused && freezeMs <= 0 && !gameOverFlag) startPacMove();
   } catch (err) {
+    if (token !== decisionToken) return;
+    preInFlight = null;
+    if (ctx.isPre) {
+      // If pacman is waiting on this pre-fetch, fall back to a fresh call.
+      if (pac.waiting && pac.col === ctx.col && pac.row === ctx.row) { jevDecide(); }
+      return;
+    }
     stats.errors++;
     pushLog(`error: ${err.message}`);
     renderStats();
-    if (token !== decisionToken) return;
-    pac.dir = legal[Math.floor(Math.random() * legal.length)];
+    pac.dir = ctx.legal[Math.floor(Math.random() * ctx.legal.length)];
     pac.waiting = false;
     setStatus('error · random fallback', 'err');
     if (!paused && freezeMs <= 0 && !gameOverFlag) startPacMove();
   }
 }
 
-function recordDecision({ legal, probs, chosen, top, conf, lat, data, dangerP, override }) {
+async function jevDecide() {
+  requestDecision({
+    col: pac.col, row: pac.row, dir: pac.dir,
+    legal: legalForPac(), segmentClear: [], isPre: false, token: decisionToken,
+  });
+}
+
+// Fire the NEXT junction's decision while pacman still travels toward it.
+function nextJunction(c, r, d) {
+  const dd = DIRS[d];
+  let nc = c + dd.dx, nr = r + dd.dy, dist = 0;
+  while (passable(nc, nr, false)) {
+    dist++;
+    const opts = openDirs(nc, nr, false).filter(x => x !== OPP[d]);
+    if (opts.length >= 2) return { col: nc, row: nr, dist };
+    nc += dd.dx; nr += dd.dy;
+  }
+  return null;
+}
+
+function maybePreRequest() {
+  const j = nextJunction(pac.col, pac.row, pac.dir);
+  if (!j || j.dist > PRE_DIST) return;
+  if (preInFlight && preInFlight.col === j.col && preInFlight.row === j.row) return;
+  if (preDecision && preDecision.col === j.col && preDecision.row === j.row) return;
+  const legal = openDirs(j.col, j.row, false).filter(x => x !== OPP[pac.dir]);
+  if (legal.length <= 1) return;
+  const segmentClear = [];
+  const dd = DIRS[pac.dir];
+  let c = pac.col + dd.dx, r = pac.row + dd.dy;
+  for (let i = 0; i < j.dist; i++) {
+    if (grid[r][c] === 'o') return;   // pellet mid-segment: strategy flips, decide fresh on arrival
+    segmentClear.push([c, r]);
+    c += dd.dx; r += dd.dy;
+  }
+  preInFlight = { col: j.col, row: j.row, dir: pac.dir, legal, token: decisionToken };
+  requestDecision({ col: j.col, row: j.row, dir: pac.dir, legal, segmentClear, isPre: true, token: decisionToken });
+}
+
+// Apply a decision (fresh or pre-fetched) at pacman's current cell:
+// temperature sampling + safety and food overrides on CURRENT positions.
+function finalizeDecision(decision) {
+  const { col, row, dir, legal, probs, conf, dangerP, lat, data } = decision;
+  if (col !== pac.col || row !== pac.row || dir !== pac.dir) return;   // stale: moved on or died
+  const wait = pac.waiting ? Math.round(performance.now() - (pac.waitStart || performance.now())) : 0;
+  let top = legal[0], tp = -1;
+  const weights = legal.map(d => {
+    const p = typeof probs[d] === 'number' ? probs[d] : 0;
+    if (p > tp) { tp = p; top = d; }
+    return Math.max(0, p) ** 2;
+  });
+  const total = weights.reduce((a, b) => a + b, 0);
+  let chosen = legal[legal.length - 1];
+  if (total > 0) {
+    let rnd = Math.random() * total;
+    for (let i = 0; i < legal.length; i++) {
+      rnd -= weights[i];
+      if (rnd <= 0) { chosen = legal[i]; break; }
+    }
+  } else {
+    chosen = legal[Math.floor(Math.random() * legal.length)];
+  }
+  // Safety override: an empty safe path always beats a chance of getting killed.
+  let override = null;
+  const chosenDanger = ghostDangerAt(pac.col + DIRS[chosen].dx, pac.row + DIRS[chosen].dy);
+  if (Number.isFinite(chosenDanger) && chosenDanger <= 2) {
+    let safest = null, sd = -1;
+    for (const d of legal) {
+      const dg = ghostDangerAt(pac.col + DIRS[d].dx, pac.row + DIRS[d].dy);
+      if (dg > sd) { sd = dg; safest = d; }
+    }
+    if (safest && sd > chosenDanger) {
+      override = { from: chosen, to: safest, reason: `ghost ${chosenDanger} from ${chosen} target vs ${sd} from ${safest}` };
+      chosen = safest;
+    }
+  }
+  // Food preference: equally safe but clearly richer alternatives win.
+  if (!override) {
+    const cU = foodUtilityAt(chosen, pac.col, pac.row, grid);
+    let best = null, bestU = cU;
+    for (const d of legal) {
+      if (d === chosen) continue;
+      const dg = ghostDangerAt(pac.col + DIRS[d].dx, pac.row + DIRS[d].dy);
+      if (dg < chosenDanger) continue;
+      const u = foodUtilityAt(d, pac.col, pac.row, grid);
+      if (u > bestU) { bestU = u; best = d; }
+    }
+    if (best && bestU - cU >= 5) {
+      override = { from: chosen, to: best, reason: `food value ${bestU.toFixed(0)} on ${best} vs ${cU.toFixed(0)} on ${chosen}` };
+      chosen = best;
+    }
+  }
+  recordDecision({ legal, probs, chosen, top, conf, lat, data, dangerP, override, wait, pre: !!decision.pre });
+  pac.dir = chosen;
+  pac.waiting = false;
+  setStatus('moving');
+  if (!paused && freezeMs <= 0 && !gameOverFlag) { startPacMove(); maybePreRequest(); }
+}
+
+function recordDecision({ legal, probs, chosen, top, conf, lat, data, dangerP, override, wait, pre }) {
   stats.calls++;
   stats.lat.push(lat);
   stats.conf.push(conf);
   if (dangerP !== null) stats.danger.push(dangerP);
   if (override) stats.overrides++;
+  if (pre) stats.preHits++;
+  stats.waits.push(wait ?? 0);
   const u = data.usage || {};
   stats.inTok += u.input_tokens || 0;
   stats.outTok += u.output_tokens || 0;
   stats.cost += u.cost || 0;
   stats.chosen[chosen]++;
-  stats.last = { legal, probs, chosen, top, conf, lat, tokens: u.input_tokens || 0, dangerP, override };
+  stats.last = { legal, probs, chosen, top, conf, lat, tokens: u.input_tokens || 0, dangerP, override, wait: wait ?? 0, pre: !!pre };
   for (const d of legal) {
     stats.offered[d]++;
     stats.probSum[d] += typeof probs[d] === 'number' ? probs[d] : 0;
   }
-  pushLog(`decided ${chosen} (${(conf * 100).toFixed(0)}%)${override ? ` [override: Jev wanted ${override.from}]` : ''} · danger ${dangerP === null ? '?' : (dangerP * 100).toFixed(0) + '%'} · ${Math.round(lat)}ms · ${u.input_tokens || 0}t`);
+  pushLog(`decided ${chosen} (${(conf * 100).toFixed(0)}%)${pre ? ' ⚡pre' : ''}${override ? ` [override: Jev wanted ${override.from}]` : ''} · danger ${dangerP === null ? '?' : (dangerP * 100).toFixed(0) + '%'} · wait ${wait ?? 0}ms · ${Math.round(lat)}ms · ${u.input_tokens || 0}t`);
   renderStats();
 }
 
@@ -576,7 +672,7 @@ function renderStats() {
         <span class="chosen-tag">${top ? '▲' : ''}${chosen ? '✓' : ''}</span>
       </div>`;
     }).join('') +
-      `<div class="dec-meta">confidence ${(L.conf * 100).toFixed(0)}% · danger est. ${L.dangerP === null ? '—' : (L.dangerP * 100).toFixed(0) + '%'} · ${Math.round(L.lat)}ms · ${L.tokens} tokens in${L.override ? `<br>safety override: Jev picked ${L.override.from}, played ${L.override.to} (${L.override.reason})` : ''}${stats.overrides ? `<br>${stats.overrides} safety override${stats.overrides === 1 ? '' : 's'} this session` : ''}</div>`;
+      `<div class="dec-meta">confidence ${(L.conf * 100).toFixed(0)}% · danger est. ${L.dangerP === null ? '—' : (L.dangerP * 100).toFixed(0) + '%'} · wait ${L.wait}ms${L.pre ? ' ⚡pre-fetched' : ''} · ${Math.round(L.lat)}ms · ${L.tokens} tokens in${L.override ? `<br>safety override: Jev picked ${L.override.from}, played ${L.override.to} (${L.override.reason})` : ''}${stats.overrides ? `<br>${stats.overrides} override${stats.overrides === 1 ? '' : 's'} this session` : ''}${stats.preHits ? `<br>${stats.preHits} of ${stats.calls} decisions pre-fetched · avg wait ${Math.round(avg(stats.waits))}ms` : ''}</div>`;
   }
 
   const dist = $('s-dist');
@@ -636,12 +732,13 @@ function newGame(resetStats = true) {
   freezeMs = 0; pendingReset = null;
   paused = false; gameOverFlag = false;
   decisionToken++;
+  preDecision = null; preInFlight = null;
   grid = MAZE.map(r => r.split('').map(ch => (ch === 'P' ? ' ' : ch)));
   resetPositions();
   if (resetStats) {
     Object.assign(stats, {
-      calls: 0, forced: 0, errors: 0, overrides: 0, inTok: 0, outTok: 0, cost: 0,
-      lat: [], conf: [], danger: [], chosen: { up: 0, down: 0, left: 0, right: 0 },
+      calls: 0, forced: 0, errors: 0, overrides: 0, preHits: 0, inTok: 0, outTok: 0, cost: 0,
+      lat: [], conf: [], danger: [], waits: [], chosen: { up: 0, down: 0, left: 0, right: 0 },
       offered: { up: 0, down: 0, left: 0, right: 0 }, probSum: { up: 0, down: 0, left: 0, right: 0 },
       log: [], last: null,
     });
@@ -817,6 +914,7 @@ window.__pac = {
     pac: { col: pac.col, row: pac.row, dir: pac.dir, waiting: pac.waiting },
     ghosts: ghosts.map(g => ({ col: g.col, row: g.row, state: g.state, fright: g.fright })),
     calls: stats.calls, errors: stats.errors, last: stats.last,
+    preFlight: !!preInFlight, preReady: !!preDecision,
   }),
   die: () => pacDies(),
   newGame: r => newGame(r),

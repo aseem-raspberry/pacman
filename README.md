@@ -16,10 +16,11 @@ The API key stays on the server; the browser only talks to the local proxy at `/
 ## How the AI plays
 
 - Pac-Man moves cell to cell on a 19×21 grid.
-- At every junction (2+ legal directions) the current state is sent to `POST https://openrouter.ai/api/alpha/decisions` with two questions: a `choice` (which direction next) and a `noul` (is a ghost dangerously close).
-- The state is a local 9×9 map centered on Pac-Man (with the ghost house marked impassable), ghost distances, and a per-direction corridor analysis (dots, pellets, ghost danger) embedded in the choice criteria.
+- At every junction (2+ legal directions) the current state is sent to `POST https://openrouter.ai/api/alpha/decisions` with two questions: a `choice` (which direction next) and a `noul` (is a ghost dangerously close). Requests are routed by provider latency.
+- Decisions are pre-fetched: while pacman travels a corridor, the next junction's decision is requested with an anticipated board (segment dots marked eaten), so the answer is usually waiting when he arrives. Typical junction wait is ~40ms even though the API takes ~400ms; the sidepane shows per-decision wait and the pre-fetch hit rate.
+- The state is a local 7×7 map centered on Pac-Man (with the ghost house marked impassable), ghost distances and headings, and a per-direction corridor analysis (dots, pellets, ghost danger) embedded in the choice criteria.
 - Jev returns calibrated probabilities per legal direction; the game plays a temperature-0.5 sample of those probabilities (best move usually, occasional exploration to avoid path loops).
-- A deterministic rule layer re-checks Jev's pick against fresh positions when the response arrives (ghosts moved during the API round trip): a safety override replaces suicide moves with the clearly safer legal move, and a food override replaces empty paths with equally safe, clearly richer ones (points per cell distance: frightened ghost 200 > pellet 50 > dot 10). Overrides are shown in the sidepane and log.
+- A deterministic rule layer re-checks the pick against fresh positions when it is applied (ghosts moved during the API round trip): a safety override replaces suicide moves with the clearly safer legal move, and a food override replaces empty paths with equally safe, clearly richer ones (points per cell distance: frightened ghost 200 > pellet 50 > dot 10). Overrides are shown in the sidepane and log.
 - Corridors (only one legal move) skip the API; on API errors the game falls back to a random legal move.
 
 ## Files
